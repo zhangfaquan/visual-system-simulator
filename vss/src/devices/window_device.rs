@@ -21,7 +21,8 @@ pub type DepthFormat = gfx::format::DepthStencil;
 
 /// A device for window and context creation.
 pub struct WindowDevice {
-    window: glutin::GlWindow,
+    headless: Option<glutin::Context<glutin::PossiblyCurrent>>,
+    windowed: Option<glutin::WindowedContext<glutin::PossiblyCurrent>>,
     events_loop: RefCell<glutin::EventsLoop>,
     device: RefCell<gfx_device_gl::Device>,
     factory: RefCell<gfx_device_gl::Factory>,
@@ -53,17 +54,36 @@ impl WindowDevice {
             .with_title(format!("Visual System Simulator - {}", config.input))
             .with_min_dimensions(LogicalSize::new(320.0, 200.0));
 
-        let context_builder = glutin::ContextBuilder::new()
-            .with_vsync(true)
-            .with_gl(gl_version);
+        // TODO: test headless code.
+        let (headless, windowed, size, mut device, mut factory, color, depth) = if false {
+            use gfx_core::format::{DepthStencil, Rgba8};
+            use gfx_core::texture::AaMode;
 
-        let (window, mut device, mut factory, render_target, main_depth) =
-            gfx_window_glutin::init::<ColorFormat, DepthFormat>(
+            let size = glutin::dpi::LogicalSize::new(256.0, 256.0);
+            let dim = (size.width as u16, size.height as u16, 8, AaMode::Multi(4));
+            let context_builder = glutin::ContextBuilder::new()
+                .with_hardware_acceleration(Some(false))
+                .build_headless(&events_loop, (size.width as u32, size.height as u32).into())
+                .expect("Failed to build headless context");
+
+            let (c, d, f, co, de) =
+                gfx_window_glutin::init_headless::<Rgba8, DepthStencil>(context_builder, dim);
+            (Some(c), None, size, d, f, co, de)
+        } else {
+            let context_builder = glutin::ContextBuilder::new()
+                .with_vsync(true)
+                .with_gl(gl_version);
+
+            let (w, d, f, co, de) = gfx_window_glutin::init::<ColorFormat, DepthFormat>(
                 window_builder,
                 context_builder,
                 &events_loop,
             )
             .unwrap();
+
+            let size = w.window().get_inner_size().unwrap();
+            (None, Some(w), size, d, f, co, de)
+        };
 
         // create our command buffer
         let encoder: gfx::Encoder<gfx_device_gl::Resources, gfx_device_gl::CommandBuffer> =
@@ -73,27 +93,27 @@ impl WindowDevice {
             device.with_gl(|gl| gl.Disable(gfx_gl::FRAMEBUFFER_SRGB));
         }
 
-        let window_size = window.get_inner_size().unwrap();
         let fallback_gaze = if let Some(ref gaze) = config.gaze {
             DeviceGaze {
                 x: gaze.x,
-                y: window_size.height as f32 - gaze.y,
+                y: size.height as f32 - gaze.y,
             }
         } else {
             DeviceGaze {
-                x: (window_size.width / 2.0) as f32,
-                y: (window_size.height / 2.0) as f32,
+                x: (size.width / 2.0) as f32,
+                y: (size.height / 2.0) as f32,
             }
         };
 
         WindowDevice {
-            window,
+            headless,
+            windowed,
             events_loop: RefCell::new(events_loop),
             device: RefCell::new(device),
             factory: RefCell::new(factory),
             encoder: RefCell::new(encoder),
-            render_target: RefCell::new(render_target),
-            main_depth: RefCell::new(main_depth),
+            render_target: RefCell::new(color),
+            main_depth: RefCell::new(depth),
             active: RefCell::new(false),
             gaze: RefCell::new(DeviceGaze {
                 x: fallback_gaze.x,
@@ -202,20 +222,23 @@ impl Device for WindowDevice {
                     | glutin::WindowEvent::CloseRequested
                     | glutin::WindowEvent::Destroyed => *done = true,
                     glutin::WindowEvent::Resized(size) => {
-                        let window = &self.window;
-                        let mut rt = self.render_target.borrow_mut();
-                        let mut md = self.main_depth.borrow_mut();
-                        let dpi_factor = window.get_hidpi_factor();
-                        window.resize(size.to_physical(dpi_factor));
-                        gfx_window_glutin::update_views(&window, &mut rt, &mut md);
+                        if let Some(windowed) = &self.windowed {
+                            let mut rt = self.render_target.borrow_mut();
+                            let mut md = self.main_depth.borrow_mut();
+                            let dpi_factor = windowed.window().get_hidpi_factor();
+                            windowed.resize(size.to_physical(dpi_factor));
+                            gfx_window_glutin::update_views(&windowed, &mut rt, &mut md);
+                        }
                     }
                     glutin::WindowEvent::CursorMoved { position, .. } => {
                         if *self.active.borrow() {
-                            let window_size = &self.window.get_inner_size().unwrap();
-                            self.gaze.replace(DeviceGaze {
-                                x: position.x as f32,
-                                y: (window_size.height - position.y) as f32,
-                            });
+                            if let Some(windowed) = &self.windowed {
+                                let window_size = windowed.window().get_inner_size().unwrap();
+                                self.gaze.replace(DeviceGaze {
+                                    x: position.x as f32,
+                                    y: (window_size.height - position.y) as f32,
+                                });
+                            }
                         }
                     }
                     glutin::WindowEvent::CursorEntered { .. } => {
@@ -238,7 +261,9 @@ impl Device for WindowDevice {
             use std::ops::DerefMut;
             let mut device = self.device.borrow_mut();
             self.encoder.borrow_mut().flush(device.deref_mut());
-            self.window.swap_buffers().unwrap();
+            if let Some(windowed) = &self.windowed {
+                windowed.swap_buffers().unwrap();
+            }
             device.cleanup();
         }
     }
